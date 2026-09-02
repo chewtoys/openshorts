@@ -76,13 +76,20 @@ _IP_SPECIFIC_HINTS = (
     "http error 407", "http error 502", "http error 503", "proxyerror",
     "tunnel connection failed", "connection reset", "timed out", "timeout",
     "unable to download webpage", "unable to download api page",
+    # "Video unavailable" looks like a content error but is NOT reliable on
+    # the static pool: on 1-sep-2026 five videos "unavailable" on all three
+    # Decodo IPs downloaded fine through the residential proxy (proxy_usage
+    # rows 19:33-07:07). YouTube serves a fake unavailable to IPs it dislikes
+    # — the same symptom as the 19-aug server-IP ban. A truly dead link costs
+    # ~3 MB to re-check; a real video wrongly refused costs the job.
+    "video unavailable",
     "available in your country", "in your country", "geo-restricted", "geoblock",
     "blocked it in your country",
     "remote end closed", "connection refused", "network is unreachable",
     "name or service not known", "eof occurred",
 )
 _CONTENT_HINTS = (
-    "private video", "video unavailable", "has been removed", "members-only",
+    "private video", "has been removed", "members-only",
     "join this channel", "not available on this app", "is not a valid url",
     "unsupported url", "no video formats found", "premieres in", "will begin in",
     "this live event", "no duration in metadata", "requested format is not available",
