@@ -17,13 +17,25 @@ job would have been 180 messages saying the same thing.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import json
+import os
 import time
 from typing import Optional
 from urllib.parse import urlparse
 
 PAID_LABELS = {"HD", "fallback"}       # download attempts billed per GB (main.plan_download_attempts)
 ALERT_COOLDOWN_SECONDS = 300
+
+# Hard ceiling on paid-proxy traffic per UTC day. Above it the paid proxy is
+# taken out of every chain until midnight: jobs that need it fail with a clear
+# message instead of bleeding money. 28-aug-2026 was $14 in one day because
+# nothing capped the fallback while the static IPs were being refused by
+# YouTube for hours. 0 disables the cap.
+DAILY_BUDGET_MB = float(os.environ.get("PAID_PROXY_DAILY_MB", "500"))
+
+_budget_cache = {"at": 0.0, "bytes": -1}
+_budget_alerted = {"day": None}
 
 _pending = {"count": 0, "bytes": 0, "lines": [], "last_sent": 0.0}
 _lock = asyncio.Lock()
@@ -126,6 +138,64 @@ async def flush_alerts():
             f"💸 Paid proxy (DataImpulse) used: {count} events, {total / 1e6:.1f} MB\n" + "\n".join(lines))
     except Exception:
         pass
+
+
+async def paid_bytes_today() -> int:
+    """Paid bytes recorded since UTC midnight (60 s cache; -1 -> unknown)."""
+    now = time.time()
+    if now - _budget_cache["at"] < 60 and _budget_cache["bytes"] >= 0:
+        return _budget_cache["bytes"]
+    try:
+        from sqlalchemy import func, select
+        from . import database as _db
+        from .models import ProxyUsage
+        day_start = _dt.datetime.now(_dt.timezone.utc).replace(hour=0, minute=0,
+                                                               second=0, microsecond=0)
+        async with _db.session() as sess:
+            total = (await sess.execute(
+                select(func.coalesce(func.sum(ProxyUsage.paid_bytes), 0))
+                .where(ProxyUsage.created_at >= day_start))).scalar_one()
+        _budget_cache.update(at=now, bytes=int(total or 0))
+        return _budget_cache["bytes"]
+    except Exception as e:
+        print(f"⚠️ paid_bytes_today failed ({e}); treating budget as not exceeded")
+        return 0
+
+
+async def budget_exceeded() -> bool:
+    """True when today's paid traffic is over PAID_PROXY_DAILY_MB.
+
+    Fails open (False) when the DB is unreachable: refusing every YouTube job
+    because the accounting query broke would be the worse failure. Alerts
+    once per UTC day when the cap trips.
+    """
+    if DAILY_BUDGET_MB <= 0:
+        return False
+    used = await paid_bytes_today()
+    if used < DAILY_BUDGET_MB * 1e6:
+        return False
+    day = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%d")
+    if _budget_alerted["day"] != day:
+        _budget_alerted["day"] = day
+        try:
+            from . import alerts
+            await alerts.send_telegram(
+                f"⛔ Paid proxy daily budget hit: {used / 1e6:.0f} MB of "
+                f"{DAILY_BUDGET_MB:.0f} MB used today. DataImpulse is disabled "
+                "until UTC midnight; jobs that need it will fail with a clear error. "
+                "Raise PAID_PROXY_DAILY_MB if this is expected.")
+        except Exception:
+            pass
+    return True
+
+
+def budget_exceeded_sync() -> bool:
+    """Non-blocking view for sync callers (the resume scan): last cached
+    value only, unknown counts as not exceeded."""
+    if DAILY_BUDGET_MB <= 0:
+        return False
+    cached = _budget_cache["bytes"]
+    return cached >= 0 and cached >= DAILY_BUDGET_MB * 1e6
 
 
 async def record_download(job_id: str, route: Optional[dict], source_url: Optional[str] = None):

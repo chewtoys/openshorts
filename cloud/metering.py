@@ -144,7 +144,7 @@ def is_youtube_url(url: str) -> bool:
                     "music.youtube.com") or host.endswith(".youtube.com")
 
 
-def probe_url_minutes(url: str) -> float:
+def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     """Return the video duration in minutes from yt-dlp metadata (no download).
 
     Uses the same proxy order + extractor settings as the actual download
@@ -181,6 +181,8 @@ def probe_url_minutes(url: str) -> float:
         k = random.randrange(len(statics))
         statics = statics[k:] + statics[:k]
     paid = os.environ.get("PROXY_URL", "").strip()
+    if not allow_paid:
+        paid = ""  # daily budget hit (cloud/proxy_ledger.budget_exceeded)
     # Same rule as the download plan: a non-YouTube URL never touches the
     # per-GB proxy (main.plan_download_attempts, youtube=False). Twitch, Kick,
     # Rumble, product pages and drive links were all reaching it here.
