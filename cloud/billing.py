@@ -17,8 +17,8 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from .config import settings, PLAN_MINUTES, TRIAL_DAYS, SUBSCRIPTION_LOOKUP_KEYS, TOPUP_LOOKUP_KEYS
-from . import config, database
-from .models import User, Subscription, CreditTopup, StripeEvent
+from . import analytics, config, database
+from .models import User, Subscription, CreditTopup, StripeEvent, SignupAttribution
 from .auth import get_current_user_required
 
 router = APIRouter()
@@ -311,7 +311,7 @@ async def list_invoices(request: Request):
     user = await get_current_user_required(request)
     if not settings.agentledger_api_key:
         raise HTTPException(status_code=503, detail="Billing backend not configured")
-    async with database.SessionLocal() as session:
+    async with database.session() as session:
         u = await session.get(User, user.id)
         customer_id = u.stripe_customer_id if u else None
     if not customer_id:
@@ -380,6 +380,9 @@ async def handle_event(event: dict):
     elif etype == "invoice.paid":
         await _set_subscription_status_by_invoice(obj, "active", created)
         await _notify_invoice_paid(obj)
+        await _track_invoice_revenue(obj)
+    elif etype == "charge.refunded":
+        await _track_refund(obj)
 
 
 async def _user_id_for_customer(session, customer_id):
@@ -395,6 +398,7 @@ async def _apply_topup(session_obj: dict):
     if minutes <= 0:
         return
     buyer_email = None
+    acquisition = {}
     async with database.session() as s:
         async with s.begin():
             existing = (await s.execute(
@@ -427,6 +431,7 @@ async def _apply_topup(session_obj: dict):
             buyer_email = (await s.execute(
                 select(User.email).where(User.id == user_id)
             )).scalar_one_or_none()
+            acquisition = await _acquisition_properties(s, user_id)
 
     amount_txt = ""
     total = session_obj.get("amount_total")
@@ -436,6 +441,12 @@ async def _apply_topup(session_obj: dict):
     await send_admin_alert(
         f"💰 Top-up purchased{amount_txt}",
         f"{buyer_email or 'A user'} bought +{minutes} minutes.",
+    )
+    # Mirror the sale into OpenPanel, on the same profile the browser identifies.
+    analytics.track_revenue(
+        user_id, total, session_obj.get("currency"),
+        type="topup", source="openshorts", minutes=minutes,
+        stripe_session_id=session_id, email=buyer_email, **acquisition,
     )
 
 
@@ -606,4 +617,99 @@ async def _notify_invoice_paid(invoice_obj: dict):
     await send_admin_alert(
         f"💵 Payment received: {money}",
         f"{email or 'A customer'} — {kind}.",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# OpenPanel revenue mirror
+# --------------------------------------------------------------------------- #
+# The browser fires ``Subscribed`` with the list price when the user comes back
+# from Stripe, but that is an intent signal: it misses renewals entirely, is
+# eaten by ad-blockers and can never see a refund. The webhook is the only
+# place money is known for certain, so every paid invoice, top-up and refund is
+# mirrored here as OpenPanel's native ``revenue`` event. ``profileId`` is the
+# user's uuid — the same id the browser and the job events already use — so
+# the sale lands on the profile that carries their pageviews and ``Signup``.
+
+_INVOICE_REVENUE_TYPE = {
+    "subscription_create": "new",
+    "subscription_cycle": "renewal",
+    "subscription_update": "upgrade",
+    "subscription_threshold": "renewal",
+}
+
+
+async def _acquisition_properties(session, user_id) -> dict:
+    """Never raises: a missing row simply reads as ``channel=direct``."""
+    try:
+        row = await session.get(SignupAttribution, user_id)
+    except Exception:
+        row = None
+    return analytics.acquisition_properties(row)
+
+
+async def _track_invoice_revenue(invoice_obj: dict):
+    try:
+        amount = int(invoice_obj.get("amount_paid") or 0)
+    except (TypeError, ValueError):
+        return
+    if amount <= 0:
+        return
+    cust = invoice_obj.get("customer")
+    if not cust:
+        return
+    async with database.session() as s:
+        user = (await s.execute(
+            select(User.id, User.email).where(User.stripe_customer_id == cust)
+        )).first()
+        if user is None:
+            return
+        user_id, email = user
+        plan = interval = None
+        sub_id = invoice_obj.get("subscription")
+        if sub_id:
+            sub = (await s.execute(
+                select(Subscription.plan, Subscription.interval).where(
+                    Subscription.stripe_subscription_id == sub_id
+                )
+            )).first()
+            if sub is not None:
+                plan, interval = sub
+        acquisition = await _acquisition_properties(s, user_id)
+    reason = invoice_obj.get("billing_reason") or ""
+    analytics.track_revenue(
+        user_id, amount, invoice_obj.get("currency"),
+        type=_INVOICE_REVENUE_TYPE.get(reason, "other"), source="openshorts",
+        plan=plan, interval=interval, billing_reason=reason or None,
+        stripe_invoice_id=invoice_obj.get("id"), email=email, **acquisition,
+    )
+
+
+async def _track_refund(charge_obj: dict):
+    """Negative revenue. ``amount_refunded`` is cumulative across partial
+    refunds, so prefer the newest entry of ``refunds.data`` when Stripe
+    includes it (it is not expanded by default on recent API versions)."""
+    refunds = ((charge_obj.get("refunds") or {}).get("data") or [])
+    raw = refunds[0].get("amount") if refunds else charge_obj.get("amount_refunded")
+    try:
+        amount = int(raw or 0)
+    except (TypeError, ValueError):
+        return
+    if amount <= 0:
+        return
+    cust = charge_obj.get("customer")
+    if not cust:
+        return
+    async with database.session() as s:
+        user = (await s.execute(
+            select(User.id, User.email).where(User.stripe_customer_id == cust)
+        )).first()
+        if user is None:
+            return
+        user_id, email = user
+        acquisition = await _acquisition_properties(s, user_id)
+    analytics.track_revenue(
+        user_id, -amount, charge_obj.get("currency"),
+        type="refund", source="openshorts",
+        stripe_charge_id=charge_obj.get("id"), email=email, **acquisition,
     )
