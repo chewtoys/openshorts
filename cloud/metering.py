@@ -151,7 +151,6 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     (main.py) so the probe behaves consistently with it and bills the same way.
     Raises ValueError if the duration is unknown (e.g. live streams).
     """
-    import yt_dlp
     # SSRF guard: reject non-http(s) / private / metadata hosts before probing.
     from security_utils import assert_public_url
     assert_public_url(url)
@@ -195,18 +194,46 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
     )
     static_errors: dict = {}
 
-    # A dead route in the chain is routine (the proxy watcher is what reports
-    # it, on Telegram); yt-dlp printing a full ERROR block per failed proxy per
-    # strategy would just flood the API log. The reason still reaches the caller
-    # through ``last_err`` below.
+    # Same cookies + PO token the download uses: an anonymous probe gets
+    # "Sign in to confirm you're not a bot" from the static IPs (4-sep-2026,
+    # all three, ~10 probes/day paying 1.8 MB each on the per-GB proxy)
+    # while the authenticated download sails through the same IPs.
+    cookies_env = os.environ.get("YOUTUBE_COOKIES")
+    ck_path = None
+    if cookies_env:
+        import tempfile
+        fd, ck_path = tempfile.mkstemp(prefix="probe_ck_", suffix=".txt")
+        with os.fdopen(fd, "w") as f:
+            f.write(cookies_env)
+    try:
+        return _probe_with_proxies(url, proxies, strategies, static_errors,
+                                   paid, ck_path)
+    finally:
+        if ck_path:
+            try:
+                os.remove(ck_path)
+            except OSError:
+                pass
+
+
+def _probe_with_proxies(url, proxies, strategies, static_errors, paid, ck_path):
+    """Walk the proxy chain (outer) x extractor strategies (inner) until one
+    reports a duration. Split out of ``probe_url_minutes`` so the temporary
+    cookie file has one obvious lifetime.
+
+    A dead route in the chain is routine (the proxy watcher is what reports it,
+    on Telegram); yt-dlp printing a full ERROR block per failed proxy per
+    strategy would just flood the API log, hence the quiet logger. The reason
+    still reaches the caller through ``last_err``.
+    """
+    import yt_dlp
+
     class _QuietLogger:
         def debug(self, msg): pass
         def info(self, msg): pass
         def warning(self, msg): pass
         def error(self, msg): pass
 
-    # Proxies outer, strategies inner: the paid proxy is only reached once every
-    # free route has failed on both extractors.
     last_err = None
     for proxy in proxies:
         is_paid = bool(paid) and proxy == paid
@@ -220,6 +247,8 @@ def probe_url_minutes(url: str, allow_paid: bool = True) -> float:
         for extractor_args in strategies:
             opts = {"skip_download": True, "quiet": True, "no_warnings": True,
                     "logger": _QuietLogger(), "extractor_args": extractor_args}
+            if ck_path:
+                opts["cookiefile"] = ck_path
             if proxy:
                 opts["proxy"] = proxy
             try:
