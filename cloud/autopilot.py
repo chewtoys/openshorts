@@ -261,6 +261,25 @@ async def fetch_social_accounts(profile: str) -> dict:
     return out
 
 
+async def is_youtube_private(video_id: str) -> bool:
+    """True when the video is private on YouTube.
+
+    oEmbed answers 401/403 for a private video and 200 for a public or
+    unlisted one. It has to run BEFORE is_youtube_short: /shorts/<id> of a
+    private video also answers 200, so a private upload read as "already a
+    short". A private video cannot be clipped at all: yt-dlp gets "Private
+    video", and the YouTube Data API behind Upload-Post lists the owner's
+    uploads but never serves the media file.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://www.youtube.com/oembed", params={
+                "url": f"https://www.youtube.com/watch?v={video_id}", "format": "json"})
+        return resp.status_code in (401, 403)
+    except Exception:
+        return False
+
+
 async def is_youtube_short(video_id: str) -> bool:
     """True when YouTube serves this id as a Short.
 
@@ -450,6 +469,16 @@ async def _start_video(user, video: dict, trigger: str, max_minutes: int) -> dic
     run_id = await _claim(user.id, video, trigger)
     if run_id is None:
         return {"status": "duplicate", "reason": "already_picked", "job_id": None}
+    if await is_youtube_private(video["id"]):
+        if trigger != "manual":
+            # Scheduled uploads are often private until they go live: let the
+            # next poll pick the video up again instead of skipping it for good.
+            async with database.session() as s:
+                async with s.begin():
+                    await s.execute(delete(AutopilotRun).where(AutopilotRun.id == run_id))
+            return {"status": SKIPPED, "reason": "private_video", "job_id": None}
+        await _update_run(run_id, status=SKIPPED, reason="private_video")
+        return {"status": SKIPPED, "reason": "private_video", "job_id": None}
     if await is_youtube_short(video["id"]):
         await _update_run(run_id, status=SKIPPED, reason="youtube_short")
         return {"status": SKIPPED, "reason": "youtube_short", "job_id": None}
@@ -738,13 +767,12 @@ async def put_autopilot(payload: AutopilotUpdate, request: Request):
                                           max_minutes=DEFAULT_MAX_MINUTES,
                                           publish_hour=DEFAULT_PUBLISH_HOUR)
                 s.add(prefs)
-            if payload.rights_ack:
+            # Connecting the channel through YouTube's own OAuth already proves it
+            # is theirs, so switching Autopilot on records the attestation
+            # instead of asking for a checkbox.
+            if payload.rights_ack or turning_on:
                 prefs.rights_ack_at = prefs.rights_ack_at or datetime.now(timezone.utc)
             if turning_on:
-                if not prefs.rights_ack_at:
-                    raise HTTPException(status_code=400, detail={
-                        "error": "rights_ack_required",
-                        "message": "Confirm you own the content of this channel first."})
                 if not prefs.enabled:
                     # New baseline: only videos published from now on.
                     prefs.enabled_at = datetime.now(timezone.utc)
@@ -812,10 +840,6 @@ async def run_now(payload: ManualRun, request: Request):
             "error": "plan_required",
             "message": "Autopilot is included in the Starter, Creator and Pro plans."})
     prefs = await _get_settings(user.id)
-    if not prefs or not prefs.rights_ack_at:
-        raise HTTPException(status_code=400, detail={
-            "error": "rights_ack_required",
-            "message": "Confirm you own the content of this channel first."})
     now = datetime.now(timezone.utc)
     if await _count_recent(user.id, "manual", now - timedelta(days=1)) >= MANUAL_DAILY_LIMIT:
         raise HTTPException(status_code=429, detail="Daily limit reached. Try again tomorrow.")
@@ -838,7 +862,8 @@ async def run_now(payload: ManualRun, request: Request):
                 AutopilotRun.user_id == user.id,
                 AutopilotRun.video_id == payload.video_id,
                 AutopilotRun.status.in_((FAILED, SKIPPED))))
-    result = await _start_video(user, video, "manual", prefs.max_minutes or DEFAULT_MAX_MINUTES)
+    result = await _start_video(user, video, "manual",
+                                (prefs.max_minutes if prefs else None) or DEFAULT_MAX_MINUTES)
     if result["status"] == "duplicate":
         raise HTTPException(status_code=409, detail="This video was already clipped by Autopilot.")
     if result.get("retry") or result["status"] == QUEUED:
